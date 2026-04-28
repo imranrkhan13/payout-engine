@@ -237,11 +237,13 @@ def create_payout(request):
     if not all([merchant_id, amount_paise, bank_account_id]):
         return Response({'error': 'merchant_id, amount_paise, and bank_account_id are required'}, status=400)
 
-    if not isinstance(amount_paise, int) or amount_paise <= 0:
-        return Response({'error': 'amount_paise must be a positive integer'}, status=400)
+    try:
+        amount_paise = int(amount_paise)
+    except (TypeError, ValueError):
+        return Response({'error': 'amount_paise must be an integer'}, status=400)
 
-    if amount_paise < 1000:
-        return Response({'error': 'Minimum payout is Rs.10 (1000 paise)'}, status=400)
+    if amount_paise <= 0:
+        return Response({'error': 'amount_paise must be positive'}, status=400)
 
     try:
         merchant = Merchant.objects.get(id=merchant_id)
