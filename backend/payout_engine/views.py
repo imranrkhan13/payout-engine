@@ -234,8 +234,14 @@ def create_payout(request):
     bank_account_id = request.data.get('bank_account_id')
     note = request.data.get('note', '').strip()[:255]
 
-    if not all([merchant_id, amount_paise, bank_account_id]):
-        return Response({'error': 'merchant_id, amount_paise, and bank_account_id are required'}, status=400)
+    if not all([merchant_id, amount_paise]):
+            return Response({'error': 'merchant_id and amount_paise are required'}, status=400)
+    bank_account = BankAccount.objects.filter(
+    merchant=merchant,
+    is_primary=True
+).first()
+    if not bank_account:
+        return Response({'error': 'No primary bank account found'}, status=400)
 
     if not isinstance(amount_paise, int) or amount_paise <= 0:
         return Response({'error': 'amount_paise must be a positive integer'}, status=400)
