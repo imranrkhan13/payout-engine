@@ -4,8 +4,7 @@ Seeds 3 merchants with bank accounts and credit history.
 """
 from django.core.management.base import BaseCommand
 from django.db import transaction
-from payout_engine.models import Merchant, BankAccount, LedgerEntry, Payout, IdempotencyKey
-
+from payout_engine.models import Merchant, BankAccount, LedgerEntry, Payout
 
 class Command(BaseCommand):
     help = 'Seed the database with test merchants, bank accounts, and credit history'
@@ -16,7 +15,6 @@ class Command(BaseCommand):
         with transaction.atomic():
             # Clear existing data
             Payout.objects.all().delete()
-            IdempotencyKey.objects.all().delete()
             LedgerEntry.objects.all().delete()
             BankAccount.objects.all().delete()
             Merchant.objects.all().delete()
