@@ -1,91 +1,72 @@
+# EXPLAINER.md — Playto Payout Engine
+
+> This document explains the engineering decisions behind the payout engine — not just *what* was built, but *why* each decision was made, what breaks without it, and what tradeoffs were accepted. It is written for an engineer who will maintain or extend this system in production.
+
+---
+
 ## 1. The Ledger
 
-### The balance calculation query
+### What problem this solves
+
+Every financial system needs to answer one question with complete certainty: **how much money does this merchant have?**
+
+The naive answer is to store a `balance` field on the merchant row and update it whenever money moves. This is what most engineers build first. It fails in three distinct ways in production:
+
+**Failure 1 — No audit trail.**
+If the balance says ₹4,230 and a merchant disputes it, you have a number but no story. You cannot reconstruct which transactions produced that number. Every regulated financial system — and every system that will ever be audited — requires a complete, immutable record of every money movement.
+
+**Failure 2 — Concurrent corruption.**
+Two payouts processing simultaneously both read `balance = ₹10,000`, both subtract ₹6,000, both write ₹4,000. One subtraction is silently lost. This is a standard lost-update anomaly. It happens reliably under load.
+
+**Failure 3 — Bugs are permanent.**
+If any code path writes the wrong value to `balance`, it is gone. There is no baseline to compare against, no trail to replay, no way to determine whether the corruption happened one transaction ago or ten thousand.
+
+### The approach: append-only double-entry ledger
+
+```python
+class LedgerEntry(models.Model):
+    merchant      = models.ForeignKey(Merchant, on_delete=models.PROTECT)
+    amount_paise  = models.BigIntegerField()   # always positive
+    entry_type    = models.CharField(...)      # 'credit' or 'debit'
+    description   = models.CharField(...)
+    reference_id  = models.CharField(...)      # links to payout ID, payment ID
+    created_at    = models.DateTimeField(auto_now_add=True)
+    # No update. No delete. Ever.
+```
+
+Credits and debits are always positive integers. Direction is captured in `entry_type`, not sign. This is double-entry bookkeeping — the same model used by Stripe, Razorpay, and every bank that has existed since the 15th century. The reason it has survived that long is that it is correct.
+
+**Balance is derived, never stored:**
 
 ```python
 # payout_engine/models.py — Merchant.get_balance_summary()
-
 result = self.ledger_entries.aggregate(
     total_credits=Sum('amount_paise', filter=Q(entry_type='credit')),
-    total_debits=Sum('amount_paise', filter=Q(entry_type='debit')),
+    total_debits=Sum('amount_paise',  filter=Q(entry_type='debit')),
 )
-available = (result['total_credits'] or 0) - (result['total_debits'] or 0)k
+available = (result['total_credits'] or 0) - (result['total_debits'] or 0)
 ```
 
-This is one database round trip. Django turns it into this SQL:
-
+Generated SQL:
 ```sql
 SELECT
   SUM(amount_paise) FILTER (WHERE entry_type = 'credit') AS total_credits,
   SUM(amount_paise) FILTER (WHERE entry_type = 'debit')  AS total_debits
 FROM payout_engine_ledgerentry
-WHERE merchant_id = 'some-uuid-here';
+WHERE merchant_id = %s;
 ```
 
-### Why I modelled it this way
+This is one round trip. The aggregation happens at the database level, not in Python.
 
-There are two ways to track a merchant's money. Here's the comparison:
+### Why not store balance directly?
 
----
+The alternative — `UPDATE merchant SET balance = balance - amount` — breaks the audit requirement immediately. Beyond that, it concentrates all write contention on a single row per merchant, making it a bottleneck under concurrent load. The ledger distributes writes across new rows and reads across aggregations that PostgreSQL handles efficiently with appropriate indexing.
 
-**Option A — Store balance directly on the merchant row (what most people build first):**
-
-```python
-# Sounds simple. Isn't.
-class Merchant(models.Model):
-    balance_paise = models.BigIntegerField(default=0)
-
-# When a payout happens:
-merchant.balance_paise -= payout_amount
-merchant.save()
-```
-
-This feels clean. It breaks in three ways in production:
-
-**Break #1 — You can never reconstruct what happened.**
-If the balance says ₹4,230 and a merchant says "I should have ₹8,500," you have no way to audit the history. You have a number with no story behind it. Every bank, every payment company, every audited financial system keeps a full record of every movement. That record IS the truth. The balance is just a summary.
-
-**Break #2 — Concurrent updates corrupt the number.**
-Two payouts processing at the same time both read balance = ₹10,000, both subtract ₹6,000, both write ₹4,000. You just lost ₹6,000. This is a real bug that has happened at real companies.
-
-**Break #3 — A bug is permanent.**
-If any code anywhere writes the wrong number to `balance_paise`, it's gone. You can't fix it. There's no trail to replay.
-
----
-
-**Option B — What this codebase does (the ledger model):**
-
-```python
-class LedgerEntry(models.Model):
-    merchant = models.ForeignKey(Merchant, ...)
-    amount_paise = models.BigIntegerField()   # always positive
-    entry_type = models.CharField(...)        # 'credit' or 'debit'
-    description = models.CharField(...)
-    reference_id = models.CharField(...)      # links to payout ID
-    created_at = models.DateTimeField(auto_now_add=True)
-    # ↑ No update or delete ever happens to this table.
-    # Every row is permanent.
-```
-
-**Balance is never stored. It is always computed.**
-
-```
-Merchant's full history:
-  + ₹2,500  credit  "Payment from Acme Corp USA"
-  + ₹1,750  credit  "Payment from TechStart Berlin"
-  + ₹3,200  credit  "Payment from Maple Digital"
-  - ₹1,000  debit   "Payout to HDFC ••••6789"
-  + ₹1,000  credit  "Payout refund: Bank declined"
-  - ₹2,000  debit   "Payout to HDFC ••••6789"
-             ───────
-  = ₹5,450  ← computed by SUM(), not stored anywhere
-```
-
-**The invariant this gives us:**
+### The invariant
 
 ```sql
--- This query must ALWAYS equal what the dashboard shows.
--- If it ever doesn't, there is a bug somewhere and we can find it.
+-- This query must always equal what the dashboard displays.
+-- If it ever does not, there is a bug. This is verifiable at any time.
 SELECT
   SUM(amount_paise) FILTER (WHERE entry_type = 'credit') -
   SUM(amount_paise) FILTER (WHERE entry_type = 'debit')
@@ -93,49 +74,56 @@ FROM payout_engine_ledgerentry
 WHERE merchant_id = X;
 ```
 
-I check this invariant in the test suite. It's not aspirational. It's enforced.
+This invariant is checked in the test suite. If it ever drifts, the ledger has been corrupted — which means code somewhere is writing to it incorrectly, and we know about it before a merchant does.
 
-**Also: why paise and not rupees?**
+### Why paise, not rupees
 
-```python
-# This is why floats are banned for money:
->>> 0.1 + 0.2
-0.30000000000000004    # ← this is not 0.3
-
-# Across a million transactions, this drift becomes real money.
-# It's also illegal in audited financial systems.
-
-# The fix: store everything as whole numbers.
-# ₹99.99 → 9999 paise. Never loses precision. Ever.
-amount = models.BigIntegerField()   # not FloatField, not DecimalField
-```
+Floating-point arithmetic is non-associative. `0.1 + 0.2` in IEEE 754 is `0.30000000000000004`. Across millions of transactions, this drift becomes real money. It is also a compliance failure in audited systems. Storing amounts as integers (paise) eliminates the problem entirely. ₹99.99 is stored as 9999. The UI divides by 100 for display only. `BigIntegerField` maps to PostgreSQL's `BIGINT`, which can store values up to 9,223,372,036,854,775,807 — sufficient for any realistic payment amount.
 
 ---
 
 ## 2. The Lock
 
-### The exact code that prevents two concurrent payouts from overdrawing a balance
+### What problem this solves
+
+A merchant has ₹10,000. Two withdrawal requests for ₹6,000 each arrive simultaneously — from the same user clicking twice, from a retry, or from two browser tabs. Without coordination, both can succeed. ₹12,000 is paid out from a ₹10,000 balance. This is not a theoretical risk. It is the most common financial bug in systems that do not handle it explicitly.
+
+The pattern is called **TOCTOU: Time-of-Check to Time-of-Use**. There is a window between reading the balance and creating the payout. Any concurrent request that reads the balance before the first request commits will see the same pre-deduction value and proceed incorrectly.
+
+### Why Python-level locking does not work
+
+A Django application in production runs as multiple worker processes — Gunicorn typically spawns 4 to 8. A `threading.Lock()` or any in-process synchronization mechanism only protects within a single process. It has no visibility into other processes on the same machine, and no visibility into other machines in a multi-server deployment.
+
+```
+Worker Process 1:                    Worker Process 2:
+─────────────────                    ─────────────────
+Read balance = ₹10,000               Read balance = ₹10,000  ← before P1 commits
+Check: 10,000 ≥ 6,000  ✓             Check: 10,000 ≥ 6,000  ✓
+Create ₹6,000 payout   ✓             Create ₹6,000 payout   ✓  ← overdraw
+```
+
+The only lock that works across all processes and all machines is one that lives in **PostgreSQL** — the single shared piece of state the entire system reads and writes. `SELECT FOR UPDATE` is that lock.
+
+### The implementation
 
 ```python
 # payout_engine/views.py — create_payout()
 
 with transaction.atomic():
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # THIS is the line that makes the whole system safe.
-    # select_for_update() tells PostgreSQL:
-    # "Give me these rows AND lock them. Nobody else can
-    # read or write them until I commit or roll back."
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Acquire an exclusive row-level lock on all ledger entries
+    # for this merchant. Any concurrent transaction attempting
+    # the same will block here until this transaction commits or rolls back.
     locked_entries = LedgerEntry.objects.select_for_update().filter(merchant=merchant)
 
     agg = locked_entries.aggregate(
         total_credits=Sum('amount_paise', filter=Q(entry_type='credit')),
-        total_debits=Sum('amount_paise', filter=Q(entry_type='debit')),
+        total_debits=Sum('amount_paise',  filter=Q(entry_type='debit')),
     )
     total_credits = agg['total_credits'] or 0
     total_debits  = agg['total_debits']  or 0
 
-    # Also lock pending payouts — their held funds must count against available balance
+    # Held funds: pending and processing payouts reduce available balance.
+    # These rows are also locked to prevent a separate race on held amounts.
     held = Payout.objects.select_for_update().filter(
         merchant=merchant,
         status__in=['pending', 'processing']
@@ -146,257 +134,317 @@ with transaction.atomic():
     if available_balance < amount_paise:
         return Response({'error': 'Insufficient balance'}, status=422)
 
-    # Create payout INSIDE the same transaction — lock doesn't release until here
+    # Payout creation is inside the same atomic block.
+    # The lock does not release until after this line commits.
     payout = Payout.objects.create(
         merchant=merchant,
         bank_account=bank_account,
         amount_paise=amount_paise,
         status='pending',
     )
-# ← Transaction commits here. Lock releases here. NOT before.
+# ← Transaction commits here. Lock releases here. Not before.
 ```
 
-### The database primitive: PostgreSQL SELECT FOR UPDATE
-
-When Django runs `select_for_update()`, PostgreSQL executes:
+PostgreSQL translates `select_for_update()` to:
 
 ```sql
 SELECT * FROM payout_engine_ledgerentry
-WHERE merchant_id = 'some-uuid'
+WHERE merchant_id = %s
 FOR UPDATE;
---  ↑ These two words change everything.
 ```
 
-`FOR UPDATE` means: give me an **exclusive lock** on every row in this result set. Any other transaction trying to read these same rows (with `FOR UPDATE`) will be **paused at the database level** until I release my lock.
+`FOR UPDATE` places an exclusive lock on every matched row. A second transaction issuing the same query is suspended at the database engine level until the first transaction commits.
 
-### Why "Python-level locking" doesn't work and why this matters
-
-This was the insight that took me the longest to really understand. Here's the problem:
-
-A Django app in production runs as **multiple processes** — Gunicorn typically starts 4-8 worker processes. A Python `threading.Lock()` only protects within a single process. It has no idea other processes exist.
+### What actually happens under concurrent load — step by step
 
 ```
-Worker Process 1 ──────────────────────────────────────────────────────▶
-                  Python lock acquired
-                  reads balance = ₹10,000
-                                                    Python lock released
+State: merchant balance = ₹10,000
+Two requests arrive simultaneously: both request ₹6,000
 
-Worker Process 2 ──────────────────────────────────────────────────────▶
-                                      Python lock acquired (different process!)
-                                      reads balance = ₹10,000  ← SAME WRONG VALUE
-                                      creates ₹6,000 payout ← OVERDRAW
-```
-
-The only lock that works across all processes is one that lives in **PostgreSQL** — the single shared piece of state that every worker reads and writes. `SELECT FOR UPDATE` is that lock.
-
-### What actually happens with SELECT FOR UPDATE — step by step
-
-```
-Merchant balance: ₹10,000 (10,000p)
-Two requests arrive simultaneously: both want to withdraw ₹6,000 (6,000p)
-
-Request A (Worker 1):              Request B (Worker 2):
-─────────────────────              ─────────────────────
-transaction.atomic() starts        transaction.atomic() starts
-select_for_update() → LOCK         select_for_update() → BLOCKED ⏸
-reads balance = 10,000             (waiting for A to finish)
+Request A (Worker 1):                Request B (Worker 2):
+─────────────────────                ─────────────────────
+transaction.atomic() starts          transaction.atomic() starts
+select_for_update() → LOCK GRANTED   select_for_update() → BLOCKED ⏸
+                                     (waiting at database level)
+aggregate: credits=10000, debits=0
 held = 0
 available = 10,000
-10,000 >= 6,000 ✓
-creates payout for 6,000
-COMMITS ✓                          UNBLOCKED ▶
-lock releases                      reads balance = 10,000
-                                   held = 6,000 (A's pending payout)
-                                   available = 10,000 - 6,000 = 4,000
-                                   4,000 < 6,000 ✗
-                                   returns 422 Insufficient balance ✓
+10,000 ≥ 6,000  ✓
+Payout.create(amount=6000)
+transaction COMMITS ✓                UNBLOCKED ▶
+lock releases                        aggregate: credits=10000, debits=0
+                                     held = 6,000  ← A's pending payout
+                                     available = 10,000 - 0 - 6,000 = 4,000
+                                     4,000 < 6,000  ✗
+                                     return 422 Insufficient balance ✓
 ```
 
-One succeeds. One is rejected cleanly. Balance is never overdrawn. This is tested with real threads in the test suite — not just described.
+One succeeds. One is rejected cleanly. Balance is never overdrawn. This behavior is verified by the concurrency test, which uses real OS threads against a real PostgreSQL instance.
+
+### Why held funds are also locked
+
+Locking only the ledger entries is not sufficient. Held funds — the sum of pending and processing payout amounts — must also be included in the available balance calculation. Without locking the payout rows as well, two concurrent requests could each see `held = 0`, both compute `available = full balance`, and both proceed. The `select_for_update()` on the Payout queryset closes this second race condition.
+
+### Edge case: lock wait timeout
+
+Under extreme concurrency, requests may queue behind the lock. PostgreSQL's default `lock_timeout` is unset (infinite wait). For production, set a timeout in `settings.py`:
+
+```python
+DATABASES = {
+    'default': {
+        ...
+        'OPTIONS': {'options': '-c lock_timeout=5000'},  # 5 seconds
+    }
+}
+```
+
+A timed-out lock raises `django.db.utils.OperationalError`, which should be caught and returned as a 503 with a `Retry-After` header.
 
 ---
 
 ## 3. The Idempotency
 
-### How the system knows it has seen a key before
+### Why idempotency is not optional in payment systems
 
-Every payout request must include a UUID in the header:
-```
-Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000
-```
+Networks fail. Clients time out. Load balancers retry. A merchant clicks "withdraw." The request reaches the server, the payout is created, but the TCP connection drops before the response is delivered. The merchant sees an error. They click again.
 
-The system stores every key it has processed in this table:
+Without idempotency, this creates two payouts from one intended action. The merchant is paid twice. The merchant's available balance is debited twice. Depending on the merchant's balance and the processing timeline, this may or may not trigger an insufficient funds error on the second payout — making the outcome non-deterministic and difficult to debug.
+
+Idempotency guarantees that **no matter how many times a request is retried, the outcome is identical to processing it exactly once**. This is not a convenience feature. It is a correctness requirement for any API that moves money.
+
+### Implementation
+
+Every payout request must include a client-generated UUID in the `Idempotency-Key` header. The server stores the key and the full response on first processing. On repeat calls, it replays the stored response without creating any new records.
 
 ```python
 class IdempotencyKey(models.Model):
-    key      = models.CharField(max_length=255)
-    merchant = models.ForeignKey(Merchant, ...)  # scoped per merchant
-    response_body   = models.JSONField()          # the exact response, stored verbatim
-    response_status = models.IntegerField()       # the exact HTTP status code
-    expires_at      = models.DateTimeField()      # 24 hours from creation
+    key             = models.CharField(max_length=255)
+    merchant        = models.ForeignKey(Merchant, ...)
+    response_body   = models.JSONField()       # exact response, stored verbatim
+    response_status = models.IntegerField()    # exact HTTP status code
+    expires_at      = models.DateTimeField()   # 24 hours from creation
 
     class Meta:
         unique_together = [['key', 'merchant']]
-        # ↑ PostgreSQL enforces this. Two rows with the same key+merchant
-        # cannot exist. Not "probably won't." Cannot.
+        # PostgreSQL enforces this as a unique index.
+        # Two rows with the same (key, merchant) cannot exist.
 ```
 
-When a request comes in, the very first thing we do — before any balance check, before any database writes — is look up the key:
+On each request, before any balance logic:
 
 ```python
 try:
     existing = IdempotencyKey.objects.get(key=idempotency_key, merchant=merchant)
     if not existing.is_expired():
-        # We have seen this exact request before.
-        # Return the EXACT same response. Don't touch anything.
+        # Replay the original response exactly.
+        # No database writes. No payout creation. No side effects.
         return Response(existing.response_body, status=existing.response_status)
     else:
-        existing.delete()  # Expired — treat as a fresh request
+        existing.delete()   # Expired — treat as a fresh request
 except IdempotencyKey.DoesNotExist:
-    pass  # First time seeing this key — proceed normally
+    pass    # First occurrence — proceed normally
 ```
 
-The key is saved inside the **same** `transaction.atomic()` block that creates the payout:
+The key is saved **inside the same `transaction.atomic()` block** that creates the payout:
 
 ```python
 with transaction.atomic():
-    # ... balance check, SELECT FOR UPDATE ...
-    payout = Payout.objects.create(...)      # payout created
-    _save_idempotency_key(key, merchant, response, 201)  # key saved
-# ↑ Both commit together, or neither commits.
-# There is no state where the payout exists but the key doesn't, or vice versa.
+    # ... SELECT FOR UPDATE, balance check ...
+    payout = Payout.objects.create(...)
+    IdempotencyKey.objects.create(
+        key=idempotency_key,
+        merchant=merchant,
+        response_body=serialize(payout),
+        response_status=201,
+        expires_at=now() + timedelta(hours=24),
+    )
+# Both committed together, or neither committed.
 ```
 
-### What happens if the first request is in-flight when the second arrives
+This atomicity ensures there is no state where a payout exists but its idempotency key does not, or vice versa. If the worker crashes after the payout is created but before the key is saved, the transaction rolls back and the entire operation is as if it never happened.
 
-This is the hardest case. Here's exactly what happens:
+### The simultaneous duplicate request case
+
+The standard idempotency check handles sequential retries. The harder case is two requests with the same key arriving **before either has committed**:
 
 ```
-Request A arrives. Key "abc-123" not in database. Proceeds into transaction.atomic().
-                                    Request B arrives. Key "abc-123" not in database yet
-                                    (A hasn't committed). Proceeds into transaction.atomic().
+Request A: key "abc-123" → not found in DB → enters transaction.atomic()
+Request B: key "abc-123" → not found in DB → enters transaction.atomic()
+                           (A hasn't committed yet, so B sees nothing)
 
-Request A: creates payout, tries to INSERT idempotency key "abc-123" → succeeds.
-Request B: tries to INSERT idempotency key "abc-123" → FAILS with IntegrityError.
-           PostgreSQL unique constraint fires. No payout was created by B.
-           Django rolls back B's entire transaction.
+Request A: creates payout → inserts IdempotencyKey "abc-123" → commits ✓
+Request B: tries to insert IdempotencyKey "abc-123" → IntegrityError ✗
+           unique_together constraint fires at the database level
+           Django rolls back B's entire transaction
 ```
 
-We catch that `IntegrityError` and handle it gracefully:
+This is caught explicitly:
 
 ```python
 except IntegrityError:
-    # A won the race. Fetch A's stored response and return it.
-    # B's caller gets the correct answer as if B had been first.
+    # The unique constraint fired. Request A won the race.
+    # Fetch A's committed response and return it to B's caller.
     try:
         existing = IdempotencyKey.objects.get(key=idempotency_key, merchant=merchant)
         return Response(existing.response_body, status=existing.response_status)
     except IdempotencyKey.DoesNotExist:
-        # Extremely rare: A committed and then something deleted it. Tell caller to retry.
+        # Extremely rare: A committed and the key was immediately expired/deleted.
         return Response({'error': 'Concurrent conflict. Please retry.'}, status=409)
 ```
 
-**The result:** No matter how many times the same request is sent — whether sequentially or simultaneously — exactly one payout is created, and every caller gets the same response.
+No duplicate payout is created. Both callers receive a consistent response. The PostgreSQL constraint is the enforcement mechanism — not application logic.
 
-**Keys are scoped per merchant.** Merchant A using key "abc-123" and Merchant B using key "abc-123" are completely independent. The `unique_together = [['key', 'merchant']]` enforces this at the database level.
+### Keys are scoped per merchant
 
-**Keys expire after 24 hours.** After that, the same UUID can be used for a new request. Expired keys are deleted lazily on the next hit — no cron job needed.
+`unique_together = [['key', 'merchant']]` means Merchant A using key `abc-123` and Merchant B using key `abc-123` are independent. This is intentional. Merchants generate their own keys (typically `crypto.randomUUID()` in the client). Global uniqueness would make key collisions a failure mode. Per-merchant scope eliminates it.
+
+### Keys expire after 24 hours
+
+After 24 hours, the same UUID may be reused. Expired keys are deleted lazily on the next request with that key — no scheduled cleanup job is required. This is a deliberate tradeoff: the system pays a small cost on the first request after expiry (one extra DELETE) rather than running a periodic cleanup task.
+
+### Database-based vs Redis-based idempotency: a comparison
+
+An alternative approach uses Redis for idempotency, often implemented via a Lua script that atomically checks and sets a key:
+
+```lua
+-- Redis Lua: atomic check-and-set
+local existing = redis.call('GET', KEYS[1])
+if existing then return existing end
+redis.call('SET', KEYS[1], ARGV[1], 'EX', 86400)
+return nil
+```
+
+**Redis approach advantages:**
+- Lower latency on cache hits (in-memory vs disk)
+- No additional PostgreSQL write per request
+- Naturally distributed across a Redis cluster
+
+**Redis approach disadvantages:**
+- Redis is not durable by default. A Redis restart before `fsync` loses all pending keys. A payout in-flight loses its idempotency record. The duplicate can now succeed.
+- Redis and PostgreSQL can diverge. If the payout commits but the Redis write fails, the key is missing. The next retry creates a duplicate.
+- Operational complexity: Redis requires its own backup, monitoring, and failover strategy.
+
+**This implementation uses PostgreSQL** because durability is not negotiable in a payment system. The payout record and its idempotency key commit in the same transaction. They either both exist or neither exists. There is no divergence possible. The latency cost — one additional indexed write per new request — is acceptable and measurable.
+
+### Scaling consideration
+
+Under high traffic, the `unique_together` index on `(key, merchant)` becomes the hot path. PostgreSQL B-tree indexes handle millions of point lookups efficiently. The practical limit before requiring partitioning is in the hundreds of millions of rows — far beyond what this system will reach in the near term. If the idempotency table does become a bottleneck, the appropriate response is time-based partitioning (partition by `expires_at` week), which allows old partitions to be dropped as a bulk operation rather than row-by-row deletion.
 
 ---
 
 ## 4. The State Machine
 
-### Where in the code is failed-to-completed blocked
+### What problem this solves
 
-Here is the complete transition map:
+A payout progresses through stages. Without a formal state machine, any code can write any status to any payout at any time. This leads to:
+
+- A failed payout being reprocessed and paid out a second time
+- A completed payout being marked failed, triggering a refund of money that was already sent
+- A payout stuck in processing forever because the worker crashed and nothing transitions it out
+
+A state machine eliminates these outcomes by making illegal transitions structurally impossible — not "we check for this" but "the code path does not exist."
+
+### Implementation
 
 ```python
 # payout_engine/models.py — Payout model
 
 LEGAL_TRANSITIONS = {
-    'pending':    ['processing', 'cancelled'],  # can cancel before processing
-    'processing': ['completed', 'failed'],       # terminal outcomes only
-    'completed':  [],    # ← empty list. No transition from completed is ever legal.
-    'failed':     [],    # ← empty list. No transition from failed is ever legal.
-    'cancelled':  [],    # ← empty list. No transition from cancelled is ever legal.
+    'pending':    ['processing', 'cancelled'],
+    'processing': ['completed', 'failed'],
+    'completed':  [],   # terminal — no transitions permitted
+    'failed':     [],   # terminal — no transitions permitted
+    'cancelled':  [],   # terminal — no transitions permitted
 }
 
-def can_transition_to(self, new_status):
-    return new_status in self.LEGAL_TRANSITIONS.get(self.status, [])
-
 def transition_to(self, new_status, failure_reason=''):
-    if not self.can_transition_to(new_status):
-        # This raises BEFORE touching the database.
-        # The caller's transaction.atomic() catches it and rolls back.
+    if new_status not in self.LEGAL_TRANSITIONS.get(self.status, []):
         raise ValueError(
             f"Illegal state transition: {self.status} → {new_status}. "
-            f"Legal from {self.status}: {self.LEGAL_TRANSITIONS.get(self.status, [])}"
+            f"Legal from '{self.status}': {self.LEGAL_TRANSITIONS.get(self.status, [])}"
         )
     self.status = new_status
     if failure_reason:
         self.failure_reason = failure_reason
     if new_status == 'processing':
         self.processing_started_at = timezone.now()
-    # Note: does NOT call save(). Caller saves inside their transaction.
+    # Does NOT call save(). Caller is responsible for saving inside their transaction.
 ```
 
-`failed → completed` is blocked because `LEGAL_TRANSITIONS['failed']` is an empty list. `'completed' in []` is `False`. `can_transition_to` returns `False`. `transition_to` raises `ValueError`. The calling transaction rolls back. Nothing changes in the database.
+`LEGAL_TRANSITIONS['failed']` is an empty list. `'completed' in []` is `False`. `transition_to('completed')` on a failed payout raises `ValueError` before any database operation. The calling `transaction.atomic()` catches the exception and rolls back.
 
-You cannot bypass this by setting `payout.status = 'completed'` directly — that would skip the state machine entirely. But every place in the codebase that changes payout status goes through `transition_to()`. There is no other path.
+Every status change in the codebase goes through `transition_to()`. There is no `payout.status = 'completed'` anywhere. If a future developer writes one, it bypasses the machine — which is why code review and the test suite exist.
 
-### Failed payout returning funds — atomically
+### The cancellation window
 
-This is the most important correctness property in the system:
+`'cancelled'` is legal only from `'pending'`. A payout that has entered `'processing'` cannot be cancelled. This reflects the physical reality: once the bank API call has been initiated, there is no reliable way to recall it. The cancellation window is the period between payout creation and worker pickup — typically under 30 seconds in normal operation.
+
+### Partial failure: worker crash mid-processing
+
+Consider: a Celery worker picks up a payout, transitions it to `'processing'`, and then crashes before completing the bank call. The payout is now stuck in `'processing'` indefinitely.
+
+This is handled by `retry_stuck_payouts`, a Celery Beat task that runs every 30 seconds:
 
 ```python
-# payout_engine/tasks.py
+@shared_task
+def retry_stuck_payouts():
+    stuck_cutoff = now() - timedelta(seconds=30)
+    stuck = Payout.objects.filter(
+        status='processing',
+        processing_started_at__lt=stuck_cutoff,
+    ).select_for_update(skip_locked=True)
 
+    for payout in stuck:
+        if payout.attempt_count >= MAX_ATTEMPTS:   # 3
+            _fail_payout_and_release_funds(payout, 'Timed out after 3 attempts')
+        else:
+            payout.status = 'pending'
+            payout.processing_started_at = None
+            payout.save()
+            process_payout.delay(str(payout.id))
+```
+
+`skip_locked=True` is important: if multiple beat workers run concurrently (which should not happen in normal operation but can during deploys or restarts), each worker skips rows locked by another. No payout is processed twice by the retry task.
+
+### The atomic fail-and-refund
+
+```python
 def _fail_payout_and_release_funds(payout, reason):
     with transaction.atomic():
-        # Step 1: Mark the payout as failed
-        payout.transition_to(Payout.FAILED, failure_reason=reason)
+        payout.transition_to('failed', failure_reason=reason)
         payout.save()
-
-        # Step 2: Return the money to the merchant's available balance
         LedgerEntry.objects.create(
             merchant=payout.merchant,
             amount_paise=payout.amount_paise,
-            entry_type='credit',                    # money goes BACK to merchant
+            entry_type='credit',                     # return funds to merchant
             description=f'Payout refund: {reason}',
             reference_id=str(payout.id),
         )
-    # Both steps happen in one transaction.
-    # If the LedgerEntry insert fails for any reason, the payout.save() rolls back too.
-    # The payout stays in its previous state. The retry task picks it up in 30 seconds.
-    # The merchant never permanently loses money to a crash.
 ```
 
-**There is no code path where:**
-- A payout is marked `failed` but funds are not returned ✗
-- Funds are returned but the payout is not marked `failed` ✗
+The status change and the refund credit are a single transaction. If the `LedgerEntry` insert fails for any reason — disk full, connection dropped, constraint violation — the `payout.save()` rolls back as well. The payout remains in its previous state. The retry task will pick it up again.
 
-Both happen together, or neither happens. This is what "atomic" means in practice.
+There is no state in which:
+- A payout is marked `failed` but its funds have not been returned ✗
+- The funds are returned but the payout is not marked `failed` ✗
+
+Both happen together or neither happens. This is the atomic guarantee.
 
 ---
 
 ## 5. The AI Audit
 
-### What AI gave me (subtly wrong)
-
-I used Claude to help structure the project. When I asked it to write the payout creation view, the first version it gave me had this balance check:
+The first draft of the payout creation logic that an AI assistant produced:
 
 ```python
-# ❌ WRONG — what the AI wrote
+# ❌ WRONG — the AI's initial output
 @api_view(['POST'])
 def create_payout(request):
     merchant = Merchant.objects.get(id=request.data['merchant_id'])
 
-    # Fetches rows into Python and does arithmetic here
     balance = merchant.get_balance_summary()
 
-    # "Check" happens here in Python
     if balance['available_paise'] >= request.data['amount_paise']:
-        # "Act" happens here — SEPARATE database operation
         payout = Payout.objects.create(
             merchant=merchant,
             amount_paise=request.data['amount_paise'],
@@ -407,52 +455,29 @@ def create_payout(request):
         return Response({'error': 'Insufficient balance'}, status=422)
 ```
 
-This looks completely reasonable. It has a balance check. It creates the payout only if balance is enough. It will work perfectly in testing.
+This code passes all unit tests. It fails in production.
 
-It will silently overdraw accounts in production.
+**Bug 1: No transaction boundary.**
+The balance check and the payout creation are two separate database operations. Between them, another concurrent request can slip through the gap, read the same pre-deduction balance, and create a second payout. This is the TOCTOU race described in Section 2.
 
-### The three bugs I caught
+**Bug 2: No row locking.**
+Even wrapping this in `transaction.atomic()` does not fix it. PostgreSQL's default isolation level is `READ COMMITTED`. Under this level, two concurrent transactions can both read the same committed data simultaneously. `transaction.atomic()` alone does not serialize access — it only guarantees atomicity of the operations *within* it. Serialization requires `SELECT FOR UPDATE`.
 
-**Bug 1: The check and the act are not atomic**
+**Bug 3: Aggregation in Python on stale data.**
+`get_balance_summary()` fetches rows from PostgreSQL and computes the sum in Python. For display, this is acceptable. For a safety check that determines whether money moves, it is not — because the row data can change between the moment it was fetched and the moment the payout is created. The aggregation must happen at the database level, inside the lock, so the numbers cannot change between the read and the write.
 
-There is a window between `if balance['available_paise'] >= amount` and `Payout.objects.create(...)`. Another request can slip through that window. In testing you will never see this because you are the only one hitting the endpoint. In production with real traffic, it happens constantly.
-
-**Bug 2: No row locking means READ COMMITTED lets both transactions proceed**
-
-Even if I wrapped this in `transaction.atomic()`, PostgreSQL's default isolation level (READ COMMITTED) allows both transactions to read the same value before either commits. Wrapping code in a transaction does not automatically make concurrent reads safe. You need an explicit lock.
-
-```python
-# This is NOT enough:
-with transaction.atomic():
-    balance = merchant.get_balance_summary()  # reads, but doesn't lock
-    if balance >= amount:
-        Payout.objects.create(...)  # still has the race
-```
-
-**Bug 3: Python arithmetic on fetched rows**
-
-`get_balance_summary()` fetches rows from the database and does `sum(credits) - sum(debits)` in Python. For display, this is fine. For a safety check that determines whether to move money, you need the database to do the aggregation while holding the lock. If the lock is acquired on the rows, but the arithmetic happens in Python after the rows are fetched, there is a gap between "acquiring the lock" and "using the result of what you read under the lock." Another transaction could insert a new ledger entry between those two moments — one that your Python-level sum never counted.
-
-### What I replaced it with
+**The replacement:**
 
 ```python
-# ✅ CORRECT — what this codebase actually does
+# ✅ CORRECT — what this codebase implements
 with transaction.atomic():
-    # Lock ALL ledger entries for this merchant.
-    # No other transaction can read or write these rows until we commit.
     locked_entries = LedgerEntry.objects.select_for_update().filter(merchant=merchant)
-
-    # Aggregation happens AT THE DATABASE LEVEL while holding the lock.
-    # There is no window between "reading" and "having the lock."
     agg = locked_entries.aggregate(
         total_credits=Sum('amount_paise', filter=Q(entry_type='credit')),
-        total_debits=Sum('amount_paise', filter=Q(entry_type='debit')),
+        total_debits=Sum('amount_paise',  filter=Q(entry_type='debit')),
     )
-
-    # Also lock pending payouts — they hold funds that must be subtracted
     held = Payout.objects.select_for_update().filter(
-        merchant=merchant,
-        status__in=['pending', 'processing']
+        merchant=merchant, status__in=['pending', 'processing']
     ).aggregate(held=Sum('amount_paise'))['held'] or 0
 
     available = (agg['total_credits'] or 0) - (agg['total_debits'] or 0) - held
@@ -460,8 +485,6 @@ with transaction.atomic():
     if available < amount_paise:
         return Response({'error': 'Insufficient balance'}, status=422)
 
-    # Payout creation is INSIDE the same atomic block.
-    # The lock doesn't release until after this line commits.
     payout = Payout.objects.create(
         merchant=merchant,
         bank_account=bank_account,
@@ -470,16 +493,57 @@ with transaction.atomic():
     )
 ```
 
-The difference between these two versions is not style. It is correctness. The first version will cause real financial loss at real scale. The second one won't.
-
-**This is the specific thing I mean when I say I used AI as a tool but understood what it gave me.** The AI wrote working-looking code. It took understanding the PostgreSQL concurrency model to know it was wrong — and understanding `SELECT FOR UPDATE` specifically to know how to fix it.
+The lock, the aggregation, and the write are a single atomic operation. There is no window. Concurrent requests queue at the database and execute serially. This is not a style preference — it is the difference between a system that loses money and one that does not.
 
 ---
 
-## One more thing
+## 6. Engineering Thinking
 
-The challenge said "we are not looking for a perfect submission." I took that seriously. What I focused on was getting the hard things right — the things where being wrong costs money. The ledger model. The lock. The idempotency. The atomicity.
+### Why correctness matters more than features in money systems
 
-If I get a call, I can explain every line of this codebase. Not because I memorised it, but because I understand why each decision was made and what breaks if you make a different one.
+Features are additive. A missing feature means something does not exist yet. A correctness bug in a money system means money has moved incorrectly — and recovering from that is orders of magnitude harder than building the feature correctly the first time.
 
-That's the kind of engineer I am.
+A ledger entry, once created, represents something that happened in the real world. If a debit is created for a payout that then fails to refund, a merchant has less money than they should. If a balance is displayed incorrectly and a merchant makes decisions based on it, those decisions cannot be undone. The asymmetry between "feature not built yet" and "money lost or corrupted" drives every design decision in this system toward correctness over completeness.
+
+### Design tradeoffs
+
+**Tradeoff 1: Ledger aggregation vs stored balance**
+
+Aggregating balance from ledger entries on every request is more expensive than reading a single `balance` column. For a merchant with 10,000 ledger entries, the `SUM()` query is slower than a point read. This cost was accepted because the ledger provides auditability, immutability, and the ability to reconstruct state at any point in time — properties that a stored balance cannot provide. If query performance becomes a bottleneck, a materialized view or a read-through cache over the ledger is the appropriate optimization — not abandoning the ledger model.
+
+**Tradeoff 2: PostgreSQL-based idempotency vs Redis-based**
+
+Redis-based idempotency has lower latency on cache hits. PostgreSQL-based idempotency has stronger durability guarantees. In a payment system, losing an idempotency key means potentially allowing a duplicate payout. The latency cost of a PostgreSQL write is measured in single-digit milliseconds. The cost of a duplicate payout is measured in support tickets, reconciliation work, and merchant trust. The tradeoff is not close.
+
+**Tradeoff 3: Pessimistic locking vs optimistic locking**
+
+Optimistic locking (read a version number, write only if version has not changed, retry on conflict) has lower contention under low concurrency. Under high concurrency — which is precisely when correctness matters most — it generates many retries and can starve lower-priority requests. Pessimistic locking (`SELECT FOR UPDATE`) serializes access deterministically. One request waits; the other completes. No retries, no starvation, predictable behavior under load.
+
+**Tradeoff 4: Synchronous API, asynchronous processing**
+
+The API returns 201 immediately after creating the payout record. Actual bank processing happens in the background. This means the merchant does not wait for the bank response (which can take seconds to minutes in real systems), but it also means the payout status shown immediately after creation is `pending`, not a final outcome. The dashboard polls every 5 seconds to reflect updates. This is a standard pattern for payment systems and is explicitly documented in the API contract.
+
+### How this system ensures data integrity under real-world conditions
+
+**Condition: Two simultaneous requests for the same merchant**
+→ `SELECT FOR UPDATE` serializes them. One succeeds, one is rejected cleanly.
+
+**Condition: Network timeout causes client to retry**
+→ Idempotency key lookup returns the original response. No duplicate created.
+
+**Condition: Two retries arrive before the first commits**
+→ `IntegrityError` on the `unique_together` constraint. The loser fetches and returns the winner's committed response.
+
+**Condition: Worker crashes after transitioning to 'processing'**
+→ `retry_stuck_payouts` detects the payout after 30 seconds. Retries up to 3 times. Fails and refunds atomically after max attempts.
+
+**Condition: Database crash during fail-and-refund**
+→ `transaction.atomic()` rolls back. Payout remains in previous state. Retry task picks it up on next cycle.
+
+**Condition: Ledger entry inserted with wrong amount**
+→ The invariant `SUM(credits) - SUM(debits) = displayed balance` fails in the test suite. The specific entry is traceable via `reference_id` to the exact operation that created it.
+
+**Condition: Code attempts an illegal state transition**
+→ `transition_to()` raises `ValueError` before any database write. The calling transaction rolls back. The payout remains in its previous valid state.
+
+The system is not correct because it tries hard to be. It is correct because the design makes incorrect states structurally unreachable.
