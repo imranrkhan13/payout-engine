@@ -18,7 +18,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'rest_framework',
     'corsheaders',
-    'payout_engine',
+    'payout_engine.apps.PayoutEngineConfig',
 ]
 
 MIDDLEWARE = [
