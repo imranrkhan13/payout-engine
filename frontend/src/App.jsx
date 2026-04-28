@@ -511,28 +511,6 @@ export default function App() {
       return null;
     }
   };
-
-  const api = {
-    post: async (path, body, headers = {}) => {
-      const res = await fetch(`${API}${path}`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Idempotency-Key": crypto.randomUUID(), // ✅ FIX
-          ...headers,
-        },
-        body: JSON.stringify(body),
-      });
-
-      const text = await res.text();
-      try {
-        return JSON.parse(text);
-      } catch {
-        console.error("Non JSON:", text);
-        return null;
-      }
-    },
-  };
   const refresh = useCallback(async () => {
     if (!selectedId) return;
     setLoadingMerchant(true);
