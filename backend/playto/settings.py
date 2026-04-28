@@ -116,7 +116,7 @@ CORS_ALLOW_HEADERS = [
     'idempotency-key',
 ]
 CORS_ALLOWED_ORIGINS = [
-    "https://your-frontend.vercel.app",
+    "https://payout-engine-ten.vercel.app/",
 ]
 CELERY_BROKER_URL = os.environ.get("REDIS_URL")
 CELERY_RESULT_BACKEND = os.environ.get("REDIS_URL")
