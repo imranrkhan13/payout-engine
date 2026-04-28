@@ -2,19 +2,51 @@ import { useState, useEffect, useCallback } from "react";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:8000/api/v1";
 
+const safeParse = async (res) => {
+  const text = await res.text();
+
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    console.error("🚨 Non-JSON response from server:", text);
+
+    return {
+      error: "Server crashed or returned invalid response",
+      raw: text,
+    };
+  }
+};
+
 const api = {
-  get: (path) => fetch(`${API}${path}`).then((r) => r.json()),
-  post: (path, body, headers = {}) =>
-    fetch(`${API}${path}`, {
+  async get(path) {
+    const res = await fetch(`${API}${path}`);
+    const data = await safeParse(res);
+
+    return data;
+  },
+
+  async post(path, body, headers = {}) {
+    const res = await fetch(`${API}${path}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", ...headers },
+      headers: {
+        "Content-Type": "application/json",
+        "Idempotency-Key": crypto.randomUUID(),
+        ...headers,
+      },
       body: JSON.stringify(body),
-    }).then(async (r) => ({ status: r.status, data: await r.json() })),
-  delete: (path) =>
-    fetch(`${API}${path}`, { method: "DELETE" }).then(async (r) => ({
-      status: r.status,
-      data: r.status === 204 ? {} : await r.json(),
-    })),
+    });
+
+    const data = await safeParse(res);
+
+    return { status: res.status, data };
+  },
+
+  async delete(path) {
+    const res = await fetch(`${API}${path}`, { method: "DELETE" });
+    const data = await safeParse(res);
+
+    return { status: res.status, data };
+  },
 };
 
 const fmt = {
@@ -497,6 +529,11 @@ export default function App() {
 
   useEffect(() => {
     api.get("/merchants/").then((data) => {
+      if (!Array.isArray(data)) {
+        console.error("Invalid merchants response", data);
+        setMerchants([]);
+        return;
+      }
       setMerchants(data);
       if (data.length > 0) setSelectedId(data[0].id);
     });
@@ -532,6 +569,7 @@ export default function App() {
   }, [refresh]);
 
   const selectedMerchant = merchants.find((m) => m.id === selectedId);
+  const safePayouts = Array.isArray(payouts) ? payouts : [];
 
   return (
     <div className="app">
@@ -583,6 +621,7 @@ export default function App() {
               )}
             </div>
             <div>
+              <PayoutHistory payouts={safePayouts.slice(0, 5)} />
               <PayoutHistory payouts={payouts.slice(0, 5)} merchantId={selectedId}
                 loading={loadingMerchant && payouts.length === 0} onRefresh={refresh} />
             </div>
