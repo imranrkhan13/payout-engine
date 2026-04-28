@@ -9,7 +9,7 @@
 
 ## Architecture
 
-![Architecture Overview](assets/architecture.svg)
+![Architecture Overview](assets/architecture.png)
 
 The system has one direction of complexity: **inward**. A request comes in from React, hits Django, acquires a database lock, creates a payout atomically, and returns immediately. The actual bank processing happens in a background worker — the merchant never waits for it.
 
