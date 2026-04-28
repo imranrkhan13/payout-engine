@@ -310,7 +310,7 @@ def create_payout(request):
             return Response({'error': 'Concurrent request conflict. Please retry.'}, status=409)
 
     try:
-        process_payout.delay(str(payout.id))
+        process_payout(str(payout.id))  # TEMP FIX
     except Exception as e:
         logger.error(f"Celery failed: {e}")
         logger.info(f"Payout {payout.id} created and queued.")

@@ -179,9 +179,12 @@ function PayoutForm({ merchant, bankAccounts, onSuccess }) {
     const idempotencyKey = crypto.randomUUID();
     const { status, data } = await api.post(
       "/payouts/",
-      { merchant_id: merchant.id, amount_paise: paise, bank_account_id: bankId, note },
+      { merchant_id: merchant.id, amount_paise: paise, bank_account_id: bankAccounts[0]?.id, note },
       { "Idempotency-Key": idempotencyKey }
     );
+    console.log("Merchant:", merchant.id);
+    console.log("Bank accounts:", bankAccounts);
+    console.log("Using bank:", bankAccounts[0]?.id);
     setLoading(false);
     if (status === 201) {
       setResult({ success: true, payout: data });
