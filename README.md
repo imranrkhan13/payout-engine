@@ -3,7 +3,7 @@
 > **Built for the Playto Founding Engineer Challenge.**  
 > A production-grade payout engine that handles the real hard problems — not just the happy path.
 
-**Live demo:** `[your-deployment-url]` &nbsp;·&nbsp; **Stack:** Django · PostgreSQL · Celery · Redis · React
+**Live demo:** `https://payout-engine-ten.vercel.app/` &nbsp;·&nbsp; **Stack:** Django · PostgreSQL · Celery · Redis · React
 
 ---
 
