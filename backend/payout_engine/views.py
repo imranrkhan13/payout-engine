@@ -218,7 +218,7 @@ def set_primary_bank_account(request, merchant_id, account_id):
     return Response({'success': True, 'primary_account_id': str(bank.id)})
 
 
-@api_view(['POST'])
+@api_view(['GET', 'POST'])
 def create_payout(request):
     idempotency_key = request.headers.get('Idempotency-Key', '').strip()
     if not idempotency_key:
@@ -309,8 +309,11 @@ def create_payout(request):
         except IdempotencyKey.DoesNotExist:
             return Response({'error': 'Concurrent request conflict. Please retry.'}, status=409)
 
-    process_payout.delay(str(payout.id))
-    logger.info(f"Payout {payout.id} created and queued.")
+    try:
+        process_payout.delay(str(payout.id))
+    except Exception as e:
+        logger.error(f"Celery failed: {e}")
+        logger.info(f"Payout {payout.id} created and queued.")
     return Response(response_body, status=response_status_code)
 
 
@@ -340,6 +343,13 @@ def cancel_payout(request, payout_id):
                 description=f'Payout cancellation refund (ref: {str(payout.id)[:8]})',
                 reference_id=str(payout.id),
             )
+    except Exception as e:
+        import traceback
+        print("===== UNEXPECTED ERROR =====")
+        traceback.print_exc()
+        print("===== END ERROR =====")
+
+        return Response({'error': str(e)}, status=500)
 
     except Payout.DoesNotExist:
         return Response({'error': 'Payout not found'}, status=404)
